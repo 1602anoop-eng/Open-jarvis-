@@ -1,52 +1,39 @@
-"""Central, env-aware resolution of OpenJarvis' home directory.
+"""Filesystem path resolution for the spec-search subsystem.
 
-OpenJarvis keeps all of its runtime state (config, databases, caches, logs,
-credentials, skills, recipes, …) under a single root so it never clutters the
-user's home directory beyond one directory. That root is resolved here, with
-the following precedence (highest first):
-
-1. ``$OPENJARVIS_HOME`` — explicit override (also honored by the shell
-   installer, see ``scripts/install/install.sh``).
-2. ``$XDG_DATA_HOME/openjarvis`` — when ``$XDG_DATA_HOME`` is set, follow the
-   XDG Base Directory spec by nesting a single ``openjarvis`` directory under
-   it. We deliberately use ONE directory rather than splitting across XDG
-   config/data/cache so the install tree stays self-contained and relocatable.
-3. ``~/.openjarvis`` — the historical default. With no env vars set, the
-   resolved path is exactly this, so existing installs are untouched.
-
-``config.py`` re-exports :func:`get_config_dir` results through the legacy
-``DEFAULT_CONFIG_DIR``/``DEFAULT_CONFIG_PATH`` names (computed dynamically) so
-the ~45 modules that import those names keep working while honoring the
-override. Modules that previously hardcoded ``Path.home() / ".openjarvis"``
-should call :func:`get_config_dir` (or :func:`get_data_dir` /
-:func:`get_cache_dir`) instead.
-
-Defense in depth: the resolved root must never live inside the OpenJarvis
-source tree (a misconfigured ``$OPENJARVIS_HOME`` pointing at the repo would
-otherwise scatter runtime artifacts into the working tree). This mirrors the
-guard in ``learning/spec_search/storage/paths.py`` and fails loudly per
-REVIEW.md's no-silent-failure discipline.
+The keystone of artifact isolation (spec §11): the resolved spec-search root
+must NEVER be inside the OpenJarvis source tree. ``resolve_spec_search_root``
+walks up from this module's ``__file__`` looking for a ``pyproject.toml`` that
+identifies the OpenJarvis source root, then refuses to operate if the resolved
+root is inside it. Defense in depth — if a user accidentally points
+``OPENJARVIS_HOME`` at the repo, the system fails loudly instead of silently
+writing artifacts into the working tree.
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
-_DEFAULT_DIR_NAME = ".openjarvis"
-_XDG_SUBDIR_NAME = "openjarvis"
+from openjarvis.core.paths import ConfigurationError, get_config_dir
+from openjarvis.security.file_utils import secure_mkdir
 
-
-class ConfigurationError(RuntimeError):
-    """Raised when the resolved home directory would violate isolation guarantees."""
+# ``ConfigurationError`` is re-exported from ``openjarvis.core.paths`` (it used
+# to be defined here). Spec search now resolves the home dir through the unified
+# core resolver, which raises the same exception type on a source-tree path, so
+# we alias rather than redefine to keep ``except ConfigurationError`` callers and
+# existing tests working.
+__all__ = [
+    "ConfigurationError",
+    "ensure_spec_search_dirs",
+    "resolve_spec_search_root",
+]
 
 
 def _find_source_root() -> Path | None:
     """Walk upward from this module to find the OpenJarvis source root.
 
-    Returns the directory containing the OpenJarvis ``pyproject.toml`` (the one
-    whose ``name = "openjarvis"``), or ``None`` when running from an installed
-    wheel rather than a source checkout.
+    Returns the directory containing the OpenJarvis ``pyproject.toml``, or
+    ``None`` if no such file is found (e.g. when running from an installed
+    wheel rather than a source checkout).
     """
     here = Path(__file__).resolve()
     for candidate in (here, *here.parents):
@@ -61,62 +48,51 @@ def _find_source_root() -> Path | None:
     return None
 
 
-def _reject_source_tree(path: Path) -> Path:
-    """Raise if ``path`` resolves inside the OpenJarvis source tree."""
-    source_root = _find_source_root()
-    if source_root is not None:
-        try:
-            path.relative_to(source_root)
-        except ValueError:
-            pass  # Good — not inside the source tree.
-        else:
-            raise ConfigurationError(
-                f"OpenJarvis home ({path}) is inside the source tree "
-                f"({source_root}). OpenJarvis refuses to write runtime state "
-                "inside its own repo. Set OPENJARVIS_HOME (or XDG_DATA_HOME) "
-                "to a directory outside the repo (default: ~/.openjarvis)."
-            )
-    return path
+def _resolve_openjarvis_home() -> Path:
+    """Resolve the OpenJarvis home directory via the unified core resolver.
 
-
-def get_config_dir() -> Path:
-    """Resolve OpenJarvis' single root directory, honoring env overrides.
-
-    Precedence: ``$OPENJARVIS_HOME`` > ``$XDG_DATA_HOME/openjarvis`` >
-    ``~/.openjarvis``. The result is always absolute and is rejected if it
-    falls inside the OpenJarvis source tree.
-    """
-    env_home = os.environ.get("OPENJARVIS_HOME")
-    if env_home:
-        resolved = Path(env_home).expanduser().resolve()
-        return _reject_source_tree(resolved)
-
-    xdg_data = os.environ.get("XDG_DATA_HOME")
-    if xdg_data:
-        resolved = (Path(xdg_data).expanduser() / _XDG_SUBDIR_NAME).resolve()
-        return _reject_source_tree(resolved)
-
-    return (Path.home() / _DEFAULT_DIR_NAME).resolve()
-
-
-def get_config_path() -> Path:
-    """Resolve the path to ``config.toml`` under the OpenJarvis root."""
-    return get_config_dir() / "config.toml"
-
-
-def get_data_dir() -> Path:
-    """Resolve the directory for persistent data (databases, blobs, …).
-
-    Consolidated under the single root; identical to :func:`get_config_dir`.
-    Provided as a distinct name so call sites read intentionally.
+    Delegates to ``get_config_dir`` so spec-search honors the same env-aware
+    resolution (OPENJARVIS_HOME and XDG) as the rest of the framework.
     """
     return get_config_dir()
 
 
-def get_cache_dir() -> Path:
-    """Resolve the directory for regenerable caches (eval datasets, etc.).
+def resolve_spec_search_root() -> Path:
+    """Return the absolute path of the spec-search root directory.
 
-    Lives at ``<root>/cache`` so caches stay inside the single OpenJarvis
-    directory instead of scattering across ``~/.cache``.
+    The root is ``$OPENJARVIS_HOME/learning`` (or ``~/.openjarvis/learning``
+    by default). Raises ``ConfigurationError`` if the resolved path lies
+    inside the OpenJarvis source tree, to prevent dev artifacts from leaking
+    into the repo.
     """
-    return get_config_dir() / "cache"
+    home = _resolve_openjarvis_home()
+    source_root = _find_source_root()
+    if source_root is not None:
+        try:
+            home.relative_to(source_root)
+        except ValueError:
+            pass  # Good — not inside the source tree.
+        else:
+            raise ConfigurationError(
+                f"OPENJARVIS_HOME ({home}) is inside the source tree "
+                f"({source_root}). Spec search refuses to write runtime "
+                "artifacts inside the OpenJarvis repo. Set OPENJARVIS_HOME "
+                "to a directory outside the repo (default: ~/.openjarvis)."
+            )
+    return home / "learning"
+
+
+def ensure_spec_search_dirs() -> Path:
+    """Create the spec-search directory layout if missing.
+
+    Returns the spec-search root. Creates ``sessions/``, ``benchmarks/``,
+    ``benchmarks/reference_outputs/``, and ``pending_review/`` underneath it,
+    all with restrictive ``0o700`` permissions via ``secure_mkdir``.
+    """
+    root = resolve_spec_search_root()
+    secure_mkdir(root)
+    secure_mkdir(root / "sessions")
+    secure_mkdir(root / "benchmarks")
+    secure_mkdir(root / "benchmarks" / "reference_outputs")
+    secure_mkdir(root / "pending_review")
+    return root

@@ -1,317 +1,328 @@
-"""Canonical data types shared across all OpenJarvis primitives."""
+"""Core data types for the evaluation framework."""
 
 from __future__ import annotations
 
-import uuid
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any, Dict, List, Optional, Sequence  # noqa: I001
-
-# ---------------------------------------------------------------------------
-# Enums
-# ---------------------------------------------------------------------------
-
-
-class Role(str, Enum):
-    """Chat message roles (OpenAI-compatible)."""
-
-    SYSTEM = "system"
-    USER = "user"
-    ASSISTANT = "assistant"
-    TOOL = "tool"
-
-
-class Quantization(str, Enum):
-    """Model quantization formats."""
-
-    NONE = "none"
-    FP8 = "fp8"
-    FP4 = "fp4"
-    INT8 = "int8"
-    INT4 = "int4"
-    GGUF = "gguf"
-    GGUF_Q4 = "gguf_q4"
-    GGUF_Q8 = "gguf_q8"
-
-
-class StepType(str, Enum):
-    """Types of steps within an agent trace."""
-
-    ROUTE = "route"
-    RETRIEVE = "retrieve"
-    GENERATE = "generate"
-    TOOL_CALL = "tool_call"
-    RESPOND = "respond"
-
-
-# ---------------------------------------------------------------------------
-# Message types
-# ---------------------------------------------------------------------------
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 
 @dataclass(slots=True)
-class ToolCall:
-    """A single tool invocation request embedded in an assistant message."""
+class EvalRecord:
+    """A single evaluation sample."""
 
-    id: str
-    name: str
-    arguments: str  # JSON string
-
-
-@dataclass(slots=True)
-class Message:
-    """A single chat message (OpenAI-compatible structure)."""
-
-    role: Role
-    content: str | None = ""
-    name: Optional[str] = None
-    tool_calls: Optional[List[ToolCall]] = None
-    tool_call_id: Optional[str] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
-    # Base64-encoded image data for vision-capable models (e.g. gemma3,
-    # qwen2.5-vl). Forwarded to Ollama's /api/chat "images" field; None or
-    # empty for text-only messages (the common case).
-    images: Optional[List[str]] = None
-
-    @property
-    def text(self) -> str:
-        """Return message content as text, treating ``None`` as empty."""
-        return self.content or ""
-
-
-@dataclass(slots=True)
-class Conversation:
-    """Ordered list of messages with an optional sliding-window cap."""
-
-    messages: List[Message] = field(default_factory=list)
-    max_messages: Optional[int] = None
-
-    def add(self, message: Message) -> None:
-        """Append a message, trimming oldest if *max_messages* is set."""
-        self.messages.append(message)
-        if self.max_messages is not None and len(self.messages) > self.max_messages:
-            self.messages = self.messages[-self.max_messages :]
-
-    def window(self, n: int) -> List[Message]:
-        """Return the last *n* messages."""
-        if n <= 0:
-            return []
-        return self.messages[-n:]
-
-
-# ---------------------------------------------------------------------------
-# Model / tool / telemetry records
-# ---------------------------------------------------------------------------
-
-
-@dataclass(slots=True)
-class ModelSpec:
-    """Metadata describing a language model."""
-
-    model_id: str
-    name: str
-    parameter_count_b: float
-    context_length: int
-    active_parameter_count_b: Optional[float] = None  # MoE active params
-    quantization: Quantization = Quantization.NONE
-    min_vram_gb: float = 0.0
-    supported_engines: Sequence[str] = ()
-    provider: str = ""
-    requires_api_key: bool = False
+    record_id: str
+    problem: str
+    reference: str
+    category: str  # "chat" | "reasoning" | "rag" | "agentic"
+    subject: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
-class ToolResult:
-    """Result returned by a tool invocation."""
+class EvalResult:
+    """Result of evaluating a single sample."""
 
-    tool_name: str
-    content: str
-    success: bool = True
-    usage: Dict[str, Any] = field(default_factory=dict)
-    cost_usd: float = 0.0
+    record_id: str
+    model_answer: str
+    is_correct: Optional[bool] = None
+    score: Optional[float] = None
     latency_seconds: float = 0.0
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-
-# Bump when token-counting methodology changes so the leaderboard can
-# distinguish entries computed under different rules.
-#   v1 = original (Ollama prompt_eval_count, may under-count due to KV cache)
-#   v2 = full prompt token count, no KV-cache assumption, system prompt
-#        always counted
-# Lives here (not in server/savings) so the telemetry layer can read it
-# without crossing the server → telemetry layering.
-TOKEN_COUNTING_VERSION: int = 2
-
-
-@dataclass(slots=True)
-class TelemetryRecord:
-    """Single telemetry observation recorded after an inference call."""
-
-    timestamp: float
-    model_id: str
     prompt_tokens: int = 0
-    prompt_tokens_evaluated: int = 0  # KV-cache-aware: actual tokens processed
     completion_tokens: int = 0
-    total_tokens: int = 0
-    latency_seconds: float = 0.0
-    ttft: float = 0.0  # time to first token
     cost_usd: float = 0.0
+    error: Optional[str] = None
+    scoring_metadata: Dict[str, Any] = field(default_factory=dict)
+    ttft: float = 0.0
     energy_joules: float = 0.0
     power_watts: float = 0.0
-    gpu_utilization_pct: float = 0.0
-    gpu_memory_used_gb: float = 0.0
-    gpu_temperature_c: float = 0.0
-    throughput_tok_per_sec: float = 0.0
-    energy_per_output_token_joules: float = 0.0
-    throughput_per_watt: float = 0.0
-    prefill_latency_seconds: float = 0.0
-    decode_latency_seconds: float = 0.0
-    prefill_energy_joules: float = 0.0
-    decode_energy_joules: float = 0.0
-    mean_itl_ms: float = 0.0
-    median_itl_ms: float = 0.0
-    p90_itl_ms: float = 0.0
-    p95_itl_ms: float = 0.0
-    p99_itl_ms: float = 0.0
-    std_itl_ms: float = 0.0
-    is_streaming: bool = False
-    engine: str = ""
-    agent: str = ""
-    energy_method: str = ""
-    energy_vendor: str = ""
-    batch_id: str = ""
-    is_warmup: bool = False
+    # Per-rail breakdown. Without these a reader cannot tell which hardware
+    # actually did the work -- and on Apple Silicon that is the whole point:
+    # an ANE-resident model draws almost nothing on the GPU rail.
     cpu_energy_joules: float = 0.0
     gpu_energy_joules: float = 0.0
     dram_energy_joules: float = 0.0
-    # Apple Neural Engine. Populated on Apple Silicon only, and the reason the
-    # rail exists here at all: Apple Foundation Models runs predominantly on
-    # the ANE, so a record carrying only CPU/GPU/DRAM would make it look
-    # nearly free.
     ane_energy_joules: float = 0.0
-    # Every rail this record's monitor measured, summed. On Apple Silicon each
-    # rail above is a partial view of one package, so the derived per-token
-    # and per-watt figures come from this rather than from GPU alone.
     soc_energy_joules: float = 0.0
-    # Which rail set the derived figures were computed from: "soc" on Apple
-    # Silicon, "gpu" elsewhere. Empty on records written before this existed.
+    # Which rail set energy_joules was taken from ("soc" / "gpu"), and how it
+    # was obtained. Without energy_method a modelled estimate is
+    # indistinguishable from a hardware measurement at read time.
     energy_basis: str = ""
-    tokens_per_joule: float = 0.0
-    # Version tag for the token-counting methodology used when this record
-    # was produced. `None` (= legacy) means the record predates per-record
-    # versioning; the leaderboard aggregator filters those out to avoid
-    # mixing pre-fix and post-fix records in the same per-token efficiency
-    # metric — they were the dominant source of the bimodal Wh/token
-    # distribution on the public leaderboard. New records always write
-    # `TOKEN_COUNTING_VERSION` from `server/savings.py`.
-    token_counting_version: Optional[int] = None
-    mining_session_id: Optional[str] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-
-# ---------------------------------------------------------------------------
-# Trace types — full interaction-level recording
-# ---------------------------------------------------------------------------
-
-
-def _trace_id() -> str:
-    return uuid.uuid4().hex[:16]
-
-
-def _message_to_dict(msg: "Message") -> Dict[str, Any]:
-    """Serialize a Message to a JSON-safe dict."""
-    d: Dict[str, Any] = {"role": msg.role.value, "content": msg.content}
-    if msg.name:
-        d["name"] = msg.name
-    if msg.tool_calls:
-        d["tool_calls"] = [
-            {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
-            for tc in msg.tool_calls
-        ]
-    if msg.tool_call_id:
-        d["tool_call_id"] = msg.tool_call_id
-    return d
+    energy_method: str = ""
+    gpu_utilization_pct: float = 0.0
+    throughput_tok_per_sec: float = 0.0
+    mfu_pct: float = 0.0
+    mbu_pct: float = 0.0
+    ipw: float = 0.0  # Intelligence Per Watt
+    ipj: float = 0.0  # Intelligence Per Joule
+    energy_per_output_token_joules: float = 0.0
+    throughput_per_watt: float = 0.0
+    mean_itl_ms: float = 0.0
+    estimated_flops: float = 0.0
+    trace_steps: int = 0
+    trace_energy_joules: float = 0.0
+    trace_data: Optional[Dict[str, Any]] = None
+    # Spec §6.2 extended fields for cross-framework comparison
+    framework: str = "openjarvis"
+    framework_commit: str = ""
+    tool_calls: int = 0
+    turn_count: int = 0
 
 
 @dataclass(slots=True)
-class TraceStep:
-    """A single step within an agent trace.
+class RunConfig:
+    """Configuration for an evaluation run."""
 
-    Each step records what the agent did (route, retrieve, generate,
-    tool_call, respond), its inputs and outputs, and timing.
-    """
-
-    step_type: StepType
-    timestamp: float
-    duration_seconds: float = 0.0
-    input: Dict[str, Any] = field(default_factory=dict)
-    output: Dict[str, Any] = field(default_factory=dict)
+    benchmark: str
+    backend: str
+    model: str
+    max_samples: Optional[int] = None
+    max_workers: int = 4
+    temperature: float = 0.0
+    max_tokens: int = 2048
+    judge_model: str = "gpt-5-mini-2025-08-07"
+    judge_engine: str = "cloud"
+    engine_key: Optional[str] = None
+    agent_name: Optional[str] = None
+    tools: List[str] = field(default_factory=list)
+    output_path: Optional[str] = None
+    seed: int = 42
+    dataset_split: Optional[str] = None
+    telemetry: bool = False
+    gpu_metrics: bool = False
     metadata: Dict[str, Any] = field(default_factory=dict)
+    warmup_samples: int = 0
+    wandb_project: str = ""
+    wandb_entity: str = ""
+    wandb_tags: str = ""
+    wandb_group: str = ""
+    sheets_spreadsheet_id: str = ""
+    sheets_worksheet: str = "Results"
+    sheets_credentials_path: str = ""
+    system_prompt: str = ""
+    episode_mode: bool = False
+    dataset_subset: Optional[str] = None
+    # Override the agent harness's max_turns budget. Default None means use
+    # the JarvisConfig.agent.max_turns value (typically 10). Set higher when
+    # running thinking/reasoning models that consume turns on intermediate
+    # reasoning before producing tool calls.
+    max_turns: Optional[int] = None
+    # Spec §6.2: backend-external endpoint config (for hermes/openclaw)
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+    # Filter dataset records by id. When set, only records whose record_id
+    # appears in this list are processed. Used for surgical re-runs of
+    # specific records (e.g. recovering silent-fake records without
+    # re-running the entire benchmark).
+    record_ids: Optional[List[str]] = None
+    # terminal-bench harness budgets (terminalbench-native backend).
+    # global_agent_timeout_sec bounds each trial's agent phase — SETUP+RUN
+    # together, since terminal-bench runs installed-agent setup inside the
+    # agent budget with an infinite tmux timeout. When set it REPLACES the
+    # per-task max_agent_timeout_sec; 0 disables the bound (per-task budgets
+    # apply); None uses the backend default (1800 s).
+    global_agent_timeout_sec: Optional[float] = None
+    # Scales per-task budgets when global_agent_timeout_sec is not set.
+    global_timeout_multiplier: Optional[float] = None
 
 
 @dataclass(slots=True)
-class Trace:
-    """Complete trace of an agent handling a query.
+class MetricStats:
+    """Descriptive statistics for a single metric across samples."""
 
-    A trace captures the full sequence of steps an agent took to handle a
-    query — which model was selected, what memory was retrieved, which tools
-    were called, and the final response.  Traces are the primary input to the
-    learning system: by analyzing which decisions led to good outcomes, the
-    system can improve routing, tool selection, and memory strategies.
-    """
+    mean: float = 0.0
+    median: float = 0.0
+    min: float = 0.0
+    max: float = 0.0
+    std: float = 0.0
+    p90: float = 0.0
+    p95: float = 0.0
+    p99: float = 0.0
 
-    trace_id: str = field(default_factory=_trace_id)
-    query: str = ""
-    agent: str = ""
-    model: str = ""
-    engine: str = ""
-    steps: List[TraceStep] = field(default_factory=list)
-    result: str = ""
-    outcome: Optional[str] = None  # None=unknown, "success", "failure"
-    feedback: Optional[float] = None  # user quality score [0, 1]
+
+@dataclass(slots=True)
+class RunSummary:
+    """Summary statistics for a completed evaluation run."""
+
+    benchmark: str
+    category: str
+    backend: str
+    model: str
+    total_samples: int
+    scored_samples: int
+    correct: int
+    accuracy: float
+    errors: int
+    mean_latency_seconds: float
+    total_cost_usd: float
+    per_subject: Dict[str, Dict[str, float]] = field(default_factory=dict)
     started_at: float = 0.0
     ended_at: float = 0.0
-    total_tokens: int = 0
-    total_latency_seconds: float = 0.0
-    metadata: Dict[str, Any] = field(default_factory=dict)
-    messages: List[Dict[str, Any]] = field(default_factory=list)
+    accuracy_stats: Optional[MetricStats] = None
+    latency_stats: Optional[MetricStats] = None
+    ttft_stats: Optional[MetricStats] = None
+    energy_stats: Optional[MetricStats] = None
+    power_stats: Optional[MetricStats] = None
+    gpu_utilization_stats: Optional[MetricStats] = None
+    throughput_stats: Optional[MetricStats] = None
+    mfu_stats: Optional[MetricStats] = None
+    mbu_stats: Optional[MetricStats] = None
+    ipw_stats: Optional[MetricStats] = None
+    ipj_stats: Optional[MetricStats] = None
+    energy_per_output_token_stats: Optional[MetricStats] = None
+    throughput_per_watt_stats: Optional[MetricStats] = None
+    itl_stats: Optional[MetricStats] = None
+    input_token_stats: Optional[MetricStats] = None
+    output_token_stats: Optional[MetricStats] = None
+    total_energy_joules: float = 0.0
+    total_estimated_flops: float = 0.0
+    flops_stats: Optional[MetricStats] = None
+    warmup_samples_excluded: int = 0
+    steady_state_reached: bool = False
+    energy_method: str = ""
+    avg_power_watts: float = 0.0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    trace_step_type_stats: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    efficiency: Optional[Dict[str, Any]] = None
+    normalized_statistics: Optional[Dict[str, Any]] = None
+    normalized_efficiency: Optional[Dict[str, Any]] = None
+    # Continuous-score reporting (added alongside binary accuracy so frontier
+    # models do not saturate the metric on rubric-judge benchmarks).
+    mean_continuous_score: Optional[float] = None
+    median_continuous_score: Optional[float] = None
+    pct_above_0_5: Optional[float] = None
+    pct_above_0_7: Optional[float] = None
+    pct_above_0_8: Optional[float] = None
+    pct_above_0_9: Optional[float] = None
+    # Internal fields set by the runner after construction
+    _output_path: Optional[Path] = None
+    _traces_dir: Optional[Path] = None
 
-    def add_step(self, step: TraceStep) -> None:
-        """Append a step and update running totals."""
-        self.steps.append(step)
-        self.total_latency_seconds += step.duration_seconds
-        self.total_tokens += step.output.get("tokens", 0)
+
+# ---------------------------------------------------------------------------
+# Eval suite config dataclasses (TOML config system)
+# ---------------------------------------------------------------------------
 
 
 @dataclass(slots=True)
-class RoutingContext:
-    """Context describing a query for model routing decisions."""
+class MetaConfig:
+    """Suite-level metadata."""
 
-    query: str = ""
-    query_length: int = 0
-    has_code: bool = False
-    has_math: bool = False
-    has_reasoning: bool = False
-    language: str = "en"
-    urgency: float = 0.5
-    complexity_score: float = 0.0  # 0.0 (trivial) to 1.0 (very complex)
-    suggested_max_tokens: int = 1024
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    name: str = ""
+    description: str = ""
+
+
+@dataclass(slots=True)
+class DefaultsConfig:
+    """Default generation parameters applied to all runs."""
+
+    temperature: float = 0.0
+    max_tokens: int = 2048
+
+
+@dataclass(slots=True)
+class JudgeConfig:
+    """Configuration for the LLM judge."""
+
+    model: str = "gpt-5-mini-2025-08-07"
+    engine: Optional[str] = None
+    provider: Optional[str] = None
+    temperature: float = 0.0
+    max_tokens: int = 1024
+
+
+@dataclass(slots=True)
+class ExecutionConfig:
+    """Execution-level settings for the eval run."""
+
+    max_workers: int = 4
+    output_dir: str = "results/"
+    seed: int = 42
+    telemetry: bool = False
+    gpu_metrics: bool = False
+    warmup_samples: int = 0
+    energy_vendor: str = ""
+    wandb_project: str = ""
+    wandb_entity: str = ""
+    wandb_tags: str = ""
+    wandb_group: str = ""
+    sheets_spreadsheet_id: str = ""
+    sheets_worksheet: str = "Results"
+    sheets_credentials_path: str = ""
+    # Override the agent harness's per-run max_turns budget. None falls back
+    # to JarvisConfig.agent.max_turns (default 10). Bump to 30-50 for
+    # thinking/reasoning models on agentic benchmarks (GAIA, LiveResearch).
+    max_turns: Optional[int] = None
+    # terminal-bench harness budgets (see RunConfig for semantics).
+    global_agent_timeout_sec: Optional[float] = None
+    global_timeout_multiplier: Optional[float] = None
+
+
+@dataclass(slots=True)
+class ModelConfig:
+    """Configuration for a single model in the eval suite."""
+
+    name: str = ""
+    engine: Optional[str] = None
+    provider: Optional[str] = None
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+    param_count_b: float = 0.0
+    active_params_b: Optional[float] = None
+    gpu_peak_tflops: float = 0.0
+    gpu_peak_bandwidth_gb_s: float = 0.0
+    num_gpus: int = 1
+
+
+@dataclass(slots=True)
+class BenchmarkConfig:
+    """Configuration for a single benchmark in the eval suite."""
+
+    name: str = ""
+    backend: str = "jarvis-direct"
+    max_samples: Optional[int] = None
+    split: Optional[str] = None
+    agent: Optional[str] = None
+    tools: List[str] = field(default_factory=list)
+    judge_model: Optional[str] = None
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+    subset: Optional[str] = None
+    record_ids: Optional[List[str]] = None
+    # Per-benchmark override of the terminal-bench harness budgets
+    # (see RunConfig for semantics).
+    global_agent_timeout_sec: Optional[float] = None
+    global_timeout_multiplier: Optional[float] = None
+
+
+@dataclass(slots=True)
+class EvalSuiteConfig:
+    """Top-level configuration for an eval suite (models x benchmarks)."""
+
+    meta: MetaConfig = field(default_factory=MetaConfig)
+    defaults: DefaultsConfig = field(default_factory=DefaultsConfig)
+    judge: JudgeConfig = field(default_factory=JudgeConfig)
+    run: ExecutionConfig = field(default_factory=ExecutionConfig)
+    models: List[ModelConfig] = field(default_factory=list)
+    benchmarks: List[BenchmarkConfig] = field(default_factory=list)
+    # Spec §6.2: optional [backend.external] section for hermes/openclaw
+    # backends. Holds the OpenAI-compatible endpoint config.
+    backend_external_base_url: Optional[str] = None
+    backend_external_api_key: Optional[str] = None
 
 
 __all__ = [
-    "Conversation",
-    "Message",
-    "ModelSpec",
-    "Quantization",
-    "Role",
-    "RoutingContext",
-    "StepType",
-    "TelemetryRecord",
-    "ToolCall",
-    "ToolResult",
-    "Trace",
-    "TraceStep",
-    "_message_to_dict",
+    "EvalRecord",
+    "EvalResult",
+    "MetricStats",
+    "RunConfig",
+    "RunSummary",
+    "MetaConfig",
+    "DefaultsConfig",
+    "JudgeConfig",
+    "ExecutionConfig",
+    "ModelConfig",
+    "BenchmarkConfig",
+    "EvalSuiteConfig",
 ]

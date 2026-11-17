@@ -1,24 +1,21 @@
-"""DatasetProvider adapter for personal benchmarks."""
+"""Abstract base class for dataset providers."""
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
+from contextlib import AbstractContextManager
 from typing import Iterable, List, Optional
 
-from openjarvis.evals.core.dataset import DatasetProvider
 from openjarvis.evals.core.types import EvalRecord
-from openjarvis.learning.optimize.personal.synthesizer import PersonalBenchmark
 
 
-class PersonalBenchmarkDataset(DatasetProvider):
-    """Wraps a PersonalBenchmark as a DatasetProvider for EvalRunner."""
+class DatasetProvider(ABC):
+    """Base class for all evaluation dataset providers."""
 
-    dataset_id: str = "personal"
-    dataset_name: str = "Personal Benchmark"
+    dataset_id: str
+    dataset_name: str
 
-    def __init__(self, benchmark: PersonalBenchmark) -> None:
-        self._benchmark = benchmark
-        self._records: List[EvalRecord] = []
-
+    @abstractmethod
     def load(
         self,
         *,
@@ -26,29 +23,40 @@ class PersonalBenchmarkDataset(DatasetProvider):
         split: Optional[str] = None,
         seed: Optional[int] = None,
     ) -> None:
-        """Convert :class:`PersonalBenchmarkSample` instances to :class:`EvalRecord`."""
-        samples = self._benchmark.samples
-        if max_samples is not None:
-            samples = samples[:max_samples]
-        self._records = [
-            EvalRecord(
-                record_id=s.trace_id,
-                problem=s.query,
-                reference=s.reference_answer,
-                category=s.category,
-                subject=s.agent or "general",
-                metadata=s.metadata,
-            )
-            for s in samples
-        ]
+        """Load the dataset (possibly downloading from HuggingFace)."""
 
+    @abstractmethod
     def iter_records(self) -> Iterable[EvalRecord]:
         """Iterate over loaded records."""
-        return iter(self._records)
 
+    @abstractmethod
     def size(self) -> int:
         """Return the number of loaded records."""
-        return len(self._records)
+
+    def __len__(self) -> int:
+        """Return the number of loaded records."""
+        return self.size()
+
+    def create_task_env(
+        self,
+        record: EvalRecord,
+    ) -> Optional[AbstractContextManager]:
+        """Return a task environment context manager, or None."""
+        return None
+
+    def verify_requirements(self) -> List[str]:
+        """Return list of unsatisfied requirements, or empty list."""
+        return []
+
+    def iter_episodes(self) -> Iterable[List[EvalRecord]]:
+        """Iterate over episodes (groups of sequential records).
+
+        Default: each record is its own single-record episode.
+        Override for benchmarks requiring sequential processing
+        with shared agent state within an episode.
+        """
+        for record in self.iter_records():
+            yield [record]
 
 
-__all__ = ["PersonalBenchmarkDataset"]
+__all__ = ["DatasetProvider"]
