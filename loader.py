@@ -1,322 +1,164 @@
-"""Skill loader — load and verify skill manifests from TOML files."""
+"""Shared helper for loading MCP server tools from a TOML config blob.
+
+Used by ``cli/ask.py``, ``cli/serve.py``, ``system/builder.py`` and
+``server/agent_manager_routes.py`` so each call site doesn't reimplement
+the server-config → transport → client → discovered-tools pipeline.
+
+The returned tuple of ``(tools, clients)`` is load-bearing: the caller
+MUST hold a reference to ``clients`` for as long as the tools are used,
+otherwise the MCP transport sessions get garbage-collected and the
+underlying HTTP connections close mid-execution (see #461 adversarial
+review). The recommended pattern is to stash the client list on the
+agent so they share its lifetime:
+
+    tools, mcp_clients = load_mcp_tools_from_config(config.tools.mcp)
+    agent = AgentCls(tools=tools, ...)
+    agent._mcp_clients = mcp_clients   # keep transports alive
+"""
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Optional
-
-import yaml
-
-from openjarvis.skills.types import SkillManifest, SkillStep
-
-try:
-    import tomllib
-except ModuleNotFoundError:
-    import tomli as tomllib  # type: ignore[no-redef]
-
+import json
 import logging
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Optional
 
-LOGGER = logging.getLogger(__name__)
+if TYPE_CHECKING:
+    from openjarvis.core.types import ToolSpec  # noqa: F401
+    from openjarvis.mcp.client import MCPClient
+    from openjarvis.tools._stubs import BaseTool
 
-
-def _read_source_metadata(path: Path) -> dict:
-    """Read .source TOML file if present, returning the parsed dict.
-
-    Returns an empty dict if the file is missing or malformed.  Never
-    raises — bad sidecar files should never break skill loading.  Logs
-    a warning when a malformed file is encountered so users can debug
-    why their imported source provenance is missing.
-    """
-    source_path = path / ".source"
-    if not source_path.exists():
-        return {}
-    try:
-        with open(source_path, "rb") as fh:
-            return tomllib.load(fh)
-    except Exception as exc:
-        LOGGER.warning(
-            "Malformed .source sidecar at %s (skill source provenance "
-            "will be missing): %s",
-            source_path,
-            exc,
-        )
-        return {}
+logger = logging.getLogger(__name__)
 
 
-def load_skill(
-    path: str | Path,
+def load_mcp_tools_from_config(
+    mcp_cfg: Any,
     *,
-    verify_signature: bool = False,
-    public_key: Optional[bytes] = None,
-    scan_for_injection: bool = False,
-) -> SkillManifest:
-    """Load a skill manifest from a TOML file.
+    allowed_names: Optional[set[str]] = None,
+    config_dir: Optional[Path] = None,
+) -> tuple[list["BaseTool"], list["MCPClient"]]:
+    """Load tools from every server in ``mcp_cfg.servers``.
 
-    Expected format:
-    ```toml
-    [skill]
-    name = "research_and_summarize"
-    version = "0.1.0"
-    description = "Search web and summarize results"
-    author = "openjarvis"
-    required_capabilities = ["network:fetch"]
-    signature = ""
+    Returns ``(tools, clients)``. ``clients`` is the list of live
+    ``MCPClient`` instances — keep a reference or the transports get
+    GC'd. Failures in any single server are logged and that server is
+    skipped; the rest are returned as a best-effort batch.
 
-    [[skill.steps]]
-    tool_name = "web_search"
-    arguments_template = '{"query": "{query}"}'
-    output_key = "search_results"
+    ``servers`` is either inline JSON or a path to a JSON file, resolved
+    exactly like ``SystemBuilder`` does via
+    :func:`openjarvis.core.config.resolve_mcp_servers`. Relative paths are
+    resolved against ``config_dir`` — pass ``config._config_dir`` — which
+    defaults to the OpenJarvis home directory.
 
-    [[skill.steps]]
-    tool_name = "think"
-    arguments_template = '{"thought": "Summarize: {search_results}"}'
-    output_key = "summary"
-    ```
+    ``allowed_names`` is an outer filter applied after each server's
+    own include/exclude filter. Pass the caller's `--tools`/`enabled`
+    list to honour CLI scoping; pass ``None`` to take every tool.
+
+    Returns ``([], [])`` when mcp is disabled or no servers are
+    configured — no exception, no warning.
     """
-    path = Path(path)
-    with open(path, "rb") as fh:
-        data = tomllib.load(fh)
+    # ``enabled`` and ``servers`` come from openjarvis.core.config's
+    # MCPConfig dataclass; accept duck-typed equivalents for tests.
+    enabled = getattr(mcp_cfg, "enabled", False)
+    servers_blob = getattr(mcp_cfg, "servers", None)
+    if not enabled or not servers_blob:
+        return [], []
 
-    skill_data = data.get("skill", {})
-
-    steps = []
-    for step_data in skill_data.get("steps", []):
-        steps.append(
-            SkillStep(
-                tool_name=step_data.get("tool_name", ""),
-                skill_name=step_data.get("skill_name", ""),
-                arguments_template=step_data.get("arguments_template", "{}"),
-                output_key=step_data.get("output_key", ""),
-            )
-        )
-
-    manifest = SkillManifest(
-        name=skill_data.get("name", path.stem),
-        version=skill_data.get("version", "0.1.0"),
-        description=skill_data.get("description", ""),
-        author=skill_data.get("author", ""),
-        steps=steps,
-        required_capabilities=skill_data.get("required_capabilities", []),
-        signature=skill_data.get("signature", ""),
-        metadata=skill_data.get("metadata", {}),
-        tags=skill_data.get("tags", []),
-        depends=skill_data.get("depends", []),
-        user_invocable=skill_data.get("user_invocable", True),
-        disable_model_invocation=skill_data.get("disable_model_invocation", False),
-    )
-
-    # Verify signature if requested
-    if verify_signature and public_key and manifest.signature:
-        try:
-            from openjarvis.security.signing import verify_b64
-
-            valid = verify_b64(
-                manifest.manifest_bytes(),
-                manifest.signature,
-                public_key,
-            )
-            if not valid:
-                raise ValueError(f"Invalid signature for skill '{manifest.name}'")
-        except ImportError:
-            raise ImportError(
-                "Signature verification requires 'cryptography'. "
-                "Install with: uv sync --extra security-signing"
-            )
-
-    # Scan for prompt injection if requested
-    if scan_for_injection:
-        try:
-            from openjarvis.security.scanner import SecretScanner
-
-            scanner = SecretScanner()
-            for step in manifest.steps:
-                scan_result = scanner.scan(step.arguments_template)
-                if scan_result.findings:
-                    raise ValueError(
-                        f"Potential prompt injection in skill '{manifest.name}', "
-                        f"step '{step.tool_name}': "
-                        f"{scan_result.findings[0].description}"
-                    )
-        except ImportError:
-            pass
-
-    return manifest
-
-
-def load_skill_markdown(path: str | Path) -> SkillManifest:
-    """Load a skill manifest from a SKILL.md file via SkillParser.
-
-    Parses YAML frontmatter (between ``---`` delimiters) and the markdown
-    body, then runs them through :class:`SkillParser` for strict validation
-    and tolerant field mapping.
-    """
-    from openjarvis.skills.parser import SkillParseError, SkillParser
-
-    path = Path(path)
-    raw = path.read_text(encoding="utf-8")
-
-    frontmatter: dict = {}
-    markdown_content = raw
-
-    if raw.startswith("---"):
-        rest = raw[3:]
-        if rest.startswith("\n"):
-            rest = rest[1:]
-        end_idx = rest.find("\n---")
-        if end_idx != -1:
-            yaml_block = rest[:end_idx]
-            try:
-                frontmatter = yaml.safe_load(yaml_block) or {}
-            except yaml.YAMLError:
-                frontmatter = {}
-            after = rest[end_idx + 4 :]
-            if after.startswith("\n"):
-                after = after[1:]
-            markdown_content = after
-
-    # Default name to file stem if missing (preserves legacy behavior)
-    if "name" not in frontmatter:
-        frontmatter["name"] = path.stem
-    if "description" not in frontmatter:
-        frontmatter["description"] = frontmatter.get("name", path.stem)
-
-    parser = SkillParser()
     try:
-        return parser.parse_frontmatter(frontmatter, markdown_content=markdown_content)
-    except SkillParseError:
-        # Legacy fallback — build manifest directly without strict validation
-        return SkillManifest(
-            name=str(frontmatter.get("name", path.stem)),
-            description=str(frontmatter.get("description", "")),
-            version=str(frontmatter.get("version", "0.1.0")),
-            author=str(frontmatter.get("author", "")),
-            tags=list(frontmatter.get("tags", []) or []),
-            required_capabilities=list(
-                frontmatter.get("required_capabilities", []) or []
-            ),
-            user_invocable=bool(frontmatter.get("user_invocable", True)),
-            disable_model_invocation=bool(
-                frontmatter.get("disable_model_invocation", False)
-            ),
-            markdown_content=markdown_content,
-        )
+        if isinstance(servers_blob, str):
+            from openjarvis.core.config import resolve_mcp_servers
+            from openjarvis.core.paths import get_config_dir
 
-
-def load_skill_directory(path: str | Path) -> SkillManifest:
-    """Load a skill from a directory containing ``skill.toml`` and/or ``SKILL.md``.
-
-    - If only ``skill.toml`` is present the manifest is loaded from TOML.
-    - If only ``SKILL.md`` is present the manifest is loaded from markdown.
-    - If both are present the TOML manifest takes precedence for structured
-      fields and ``markdown_content`` is merged in from the markdown file.
-    - If neither is present a ``FileNotFoundError`` is raised.
-    """
-    path = Path(path)
-    toml_path = path / "skill.toml"
-    md_path = path / "SKILL.md"
-
-    has_toml = toml_path.exists()
-    has_md = md_path.exists()
-
-    if not has_toml and not has_md:
-        raise FileNotFoundError(
-            f"No skill.toml or SKILL.md found in directory '{path}'"
-        )
-
-    if has_toml:
-        manifest = load_skill(toml_path)
-        if has_md:
-            md_manifest = load_skill_markdown(md_path)
-            # Merge markdown content into the TOML-sourced manifest
-            manifest = SkillManifest(
-                name=manifest.name,
-                version=manifest.version,
-                description=manifest.description,
-                author=manifest.author,
-                steps=manifest.steps,
-                required_capabilities=manifest.required_capabilities,
-                signature=manifest.signature,
-                metadata=manifest.metadata,
-                tags=manifest.tags,
-                depends=manifest.depends,
-                user_invocable=manifest.user_invocable,
-                disable_model_invocation=manifest.disable_model_invocation,
-                markdown_content=md_manifest.markdown_content,
+            server_list = resolve_mcp_servers(
+                servers_blob, config_dir or get_config_dir()
             )
-    else:
-        # Only markdown present
-        manifest = load_skill_markdown(md_path)
+        else:
+            server_list = servers_blob
+    except (OSError, UnicodeError, ValueError, TypeError) as exc:
+        logger.warning("Failed to parse MCP servers config: %s", exc)
+        return [], []
+    if not isinstance(server_list, list):
+        logger.warning(
+            "MCP servers config is not a list (got %r) — skipping MCP discovery",
+            type(server_list).__name__,
+        )
+        return [], []
 
-    # Promote .source file's source field into manifest.metadata.openjarvis.source
-    source_data = _read_source_metadata(path)
-    if source_data:
-        # Extract just the source name (e.g. "hermes" from "hermes:apple-notes")
-        source_str = source_data.get("source", "")
-        source_name = source_str.partition(":")[0] if source_str else ""
-        if source_name:
-            new_metadata = dict(manifest.metadata) if manifest.metadata else {}
-            oj = dict(new_metadata.get("openjarvis", {}) or {})
-            oj["source"] = source_name
-            new_metadata["openjarvis"] = oj
-            manifest.metadata = new_metadata
+    # Imported lazily so that `openjarvis.mcp.loader` can be imported
+    # cheaply from CLI startup paths without dragging in the heavy MCP
+    # client stack until something actually wants to discover tools.
+    from openjarvis.mcp.client import MCPClient
+    from openjarvis.mcp.transport import StdioTransport, StreamableHTTPTransport
+    from openjarvis.tools.mcp_adapter import MCPToolProvider
 
-    return manifest
+    tools: list["BaseTool"] = []
+    clients: list["MCPClient"] = []
 
-
-def discover_skills(directory: str | Path) -> list[SkillManifest]:
-    """Scan a directory for skill definitions and load them.
-
-    Handles three layouts:
-    - Flat ``*.toml`` files directly inside *directory*.
-    - Skill directories: ``<directory>/<name>/{skill.toml,SKILL.md}``.
-    - Sourced layout: ``<directory>/<source>/<name>/{skill.toml,SKILL.md}``.
-    """
-    directory = Path(directory).expanduser()
-    if not directory.exists():
-        return []
-
-    manifests: list[SkillManifest] = []
-
-    # Flat *.toml files at the top level
-    for toml_file in sorted(directory.glob("*.toml")):
+    for server_cfg in server_list:
         try:
-            manifests.append(load_skill(toml_file))
-        except Exception as exc:
-            LOGGER.warning("Failed to load skill from %s: %s", toml_file, exc)
-            continue
+            cfg = json.loads(server_cfg) if isinstance(server_cfg, str) else server_cfg
+            name = cfg.get("name", "<unnamed>")
+            url = cfg.get("url")
+            token = cfg.get("token")
+            command = cfg.get("command", "")
+            args = cfg.get("args", [])
 
-    # Walk one or two levels deep looking for skill packages
-    for child in sorted(directory.iterdir()):
-        if not child.is_dir():
-            continue
-        # Direct skill package: <child>/{skill.toml,SKILL.md}
-        if (child / "skill.toml").exists() or (child / "SKILL.md").exists():
+            if url:
+                transport = StreamableHTTPTransport(url=url, token=token)
+            elif command:
+                transport = StdioTransport(command=[command] + args)
+            else:
+                logger.warning(
+                    "MCP server '%s' has neither 'url' nor 'command' — skipping",
+                    name,
+                )
+                continue
+
+            client = MCPClient(transport)
             try:
-                manifests.append(load_skill_directory(child))
-            except Exception as exc:
-                LOGGER.warning("Failed to load skill from %s: %s", child, exc)
-                continue
+                client.initialize()
+            except Exception:
+                # Not yet in `clients`, so nothing else will ever close it
+                # (and the underlying subprocess/connection pool) if we
+                # don't do it here (#753).
+                try:
+                    client.close()
+                except Exception as cleanup_exc:
+                    # Cleanup is best-effort here.  Preserve the initialize()
+                    # exception as the discovery failure while still making a
+                    # failed cleanup visible to operators.
+                    logger.warning(
+                        "Failed to close MCP client for '%s' after "
+                        "initialization failed: %s",
+                        name,
+                        cleanup_exc,
+                        exc_info=True,
+                    )
+                raise
+            clients.append(client)
+
+            provider = MCPToolProvider(client)
+            discovered = provider.discover()
+
+            include_tools = set(cfg.get("include_tools", []))
+            exclude_tools = set(cfg.get("exclude_tools", []))
+            if include_tools:
+                discovered = [t for t in discovered if t.spec.name in include_tools]
+            if exclude_tools:
+                discovered = [t for t in discovered if t.spec.name not in exclude_tools]
+            if allowed_names:
+                discovered = [t for t in discovered if t.spec.name in allowed_names]
+
+            tools.extend(discovered)
+            logger.info(
+                "Discovered %d MCP tools from server '%s'", len(discovered), name
+            )
+        except Exception as exc:  # per-server isolation
+            logger.warning(
+                "Failed to discover MCP tools from '%s': %s",
+                cfg.get("name", "<unnamed>") if "cfg" in locals() else "<unparsed>",
+                exc,
+            )
             continue
 
-        # Sourced layout: <child>/<grandchild>/{skill.toml,SKILL.md}
-        for grandchild in sorted(child.iterdir()):
-            if not grandchild.is_dir():
-                continue
-            if (grandchild / "skill.toml").exists() or (
-                grandchild / "SKILL.md"
-            ).exists():
-                try:
-                    manifests.append(load_skill_directory(grandchild))
-                except Exception as exc:
-                    LOGGER.warning("Failed to load skill from %s: %s", grandchild, exc)
-                    continue
-
-    return manifests
-
-
-__all__ = [
-    "load_skill",
-    "load_skill_markdown",
-    "load_skill_directory",
-    "discover_skills",
-]
+    return tools, clients
