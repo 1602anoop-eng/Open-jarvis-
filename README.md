@@ -1,18 +1,11 @@
-# OpenJarvis — Phone Edition (Groq)
+# Pearl Tooling
 
-Lightweight build (<25 MB): no desktop binaries, tests, docs, or Rust.
-Runs on Android via Termux; inference happens on Groq's cloud, so no GPU/RAM needed.
+This directory holds standalone Pearl ecosystem utilities that are useful during
+model enablement or validation but are not part of the OpenJarvis runtime.
 
-1. Get a free key: https://console.groq.com/keys
-2. In Termux: `bash phone/setup_termux.sh`
-3. Quick chat: `python phone/groq_chat.py "hi"`
-4. Full framework: `mkdir -p ~/.openjarvis && cp phone/config.toml ~/.openjarvis/ && jarvis`
+- `model_converter.py` creates experimental Pearl-compatible staging
+  checkpoints from raw Hugging Face safetensors models.
 
-Python use:
-```python
-from openjarvis.engine.groq import GroqEngine
-from openjarvis.core.types import Message, Role
-e = GroqEngine()   # reads GROQ_API_KEY
-print(e.generate([Message(role=Role.USER, content="Hi")], model="llama-3.3-70b-versatile"))
-```
-Never commit your key; keep it in the env var.
+Keep user-facing mining commands in `src/openjarvis/cli/` and runtime provider
+code in `src/openjarvis/mining/`. Scripts here should be explicit operational
+tools that developers run manually.
